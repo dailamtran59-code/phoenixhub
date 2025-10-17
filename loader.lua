@@ -1,44 +1,76 @@
--- loader.lua (dùng với executor như Synapse)
-local base = "https://raw.githubusercontent.com/<user>/<repo>/main/"
+-- safe_loader.lua
+local base = "https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/"
+local mainRaw = "https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/PhoenixMain.lua"
 
-local files = {
-    "modules/CONFIG.lua",
-    "modules/UTILS.lua",
-    "modules/UI.lua",
-    "modules/ESP.lua",
-    "modules/AIMBOT.lua",
-    "modules/MOVEMENT.lua",
-    "PhoenixMain.lua",
+local modulesList = {
+    "CONFIG.lua",
+    "UTILS.lua",
+    "UI.lua",
+    "ESP.lua",
+    "AIMBOT.lua",
+    "MOVEMENT.lua",
 }
 
 local loaded = {}
 
-for _,f in ipairs(files) do
-    local url = base .. f
-    local ok, res = pcall(function() return game:HttpGet(url) end)
-    if not ok then
-        warn("Không tải được: ".. url)
+local function safeLoadUrl(url)
+    local ok, res = pcall(function() return game:HttpGet(url, true) end)
+    if not ok then return false, ("HttpGet failed: %s"):format(tostring(res)) end
+    if not res or res == "" then return false, "Empty response" end
+    local fn, err = loadstring(res)
+    if not fn then return false, ("loadstring parse error: %s"):format(tostring(err)) end
+    local ok2, ret = pcall(fn)
+    if not ok2 then return false, ("runtime error executing chunk: %s"):format(tostring(ret)) end
+    return true, ret
+end
+
+for _,f in ipairs(modulesList) do
+    local url = base..f
+    local ok, ret = safeLoadUrl(url)
+    if ok then
+        print("[loader] loaded module:", f)
+        loaded[f] = ret
     else
-        -- set chunk environment so require() inside modules can work if you implement simple require shim
-        local fn, err = loadstring(res)
-        if not fn then
-            warn("Lỗi parse:", err)
-        else
-            -- run the module and capture returned value in loaded table keyed by filename
-            local ret = fn()
-            loaded[f] = ret
-        end
+        warn("[loader] failed to load", f, "->", ret)
+        loaded[f] = nil
     end
 end
 
--- Nếu bạn muốn hỗ trợ require giữa các module khi chạy bằng loader,
--- bạn có thể implement một require shim, ví dụ:
-local function shimRequire(path)
-    -- map "modules/CONFIG.lua" -> loaded[path]
-    return loaded[path]
+-- ensure stub for critical modules if missing
+local function makeStub(name)
+    local s = {}
+    if name:lower():find("esp") then
+        s.updateAll = function() end
+        s.setupEnemyESP = function() end
+    elseif name:lower():find("aim") then
+        s.getClosestTarget = function() return nil end
+        s.aimAt = function() end
+    end
+    return s
 end
 
--- cuối cùng gọi main (nếu main dùng returned table)
-if loaded["PhoenixMain.lua"] and type(loaded["PhoenixMain.lua"].start) == "function" then
-    loaded["PhoenixMain.lua"].start(shimRequire)
+if not loaded["CONFIG.lua"] then
+    warn("CONFIG missing -> aborting because config is required")
+    return
+end
+
+-- load main
+local ok, ret = safeLoadUrl(mainRaw)
+if not ok then
+    error("Failed to load PhoenixMain.lua: "..tostring(ret))
+end
+print("[loader] PhoenixMain loaded, starting...")
+
+-- if main expects modules via global table, expose loaded
+_G.PhoenixModules = loaded
+
+-- if PhoenixMain returns a function start(), call it
+if type(ret) == "table" and type(ret.start) == "function" then
+    local success, err = pcall(ret.start, loaded)
+    if not success then warn("PhoenixMain.start error:", err) end
+elseif type(ret) == "function" then
+    local success, err = pcall(ret, loaded)
+    if not success then warn("PhoenixMain call error:", err) end
+else
+    print("PhoenixMain returned non-callable; loader finished.")
 end
