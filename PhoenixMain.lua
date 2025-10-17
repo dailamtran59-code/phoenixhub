@@ -1,20 +1,17 @@
--- nếu dùng ModuleScript: local modules = script.Parent.modules
-local CONFIG = require(script.modules.CONFIG)
-local UTILS = require(script.modules.UTILS)
-local UI = require(script.modules.UI)
-local ESP = require(script.modules.ESP)
-local AIM = require(script.modules.AIMBOT)
-local MOV = require(script.modules.MOVEMENT)
+local modules = {
+    CONFIG = loadstring(game:HttpGet("https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/CONFIG.lua"))(),
+    UTILS = loadstring(game:HttpGet("https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/UTILS.lua"))(),
+    UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/UI.lua"))(),
+    ESP = loadstring(game:HttpGet("https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/ESP.lua"))(),
+    AIMBOT = loadstring(game:HttpGet("https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/AIMBOT.lua"))(),
+    MOVEMENT = loadstring(game:HttpGet("https://raw.githubusercontent.com/dailamtran59-code/phoenixhub/main/modules/MOVEMENT.lua"))(),
+}
 
-local ScreenGui, Pages = UI.createGui()
-ScreenGui.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+local Config = modules.CONFIG
+local UI = modules.UI
+local UTILS = modules.UTILS
 
--- ví dụ đăng ký RenderStepped
-local RunService = game:GetService("RunService")
-RunService.RenderStepped:Connect(function(dt)
-    -- ESP update
-    ESP.updateAll()
-    -- Movement update
-    MOV.updateWalkspeed()
-    -- Aimbot active check ...
-end)
+-- Khởi tạo GUI
+local ScreenGui, Pages = UI.createGui(Config)
+
+print("PhoenixMain loaded successfully!")
