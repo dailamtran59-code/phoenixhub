@@ -1,28 +1,14 @@
+local ESP = {}
+
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local CONFIG = require(script.Parent.CONFIG)
-local UTILS = require(script.Parent.UTILS)
+local LocalPlayer = Players.LocalPlayer
+local workspace = game:GetService("Workspace")
 
-local M = {}
-M.enemyHighlights = {}
-M.enemyBeams = {}
+local enemyHighlights = {}
+local enemyBeams = {}
 
-function M.setupEnemyESP(player)
-    -- copy logic từ script chính: tạo Highlight, set FillColor... tương tự
+function ESP.updateESP(Config, colorByName)
+    -- Code phần setupEnemyESP, ensureBeamBetween, removeBeamForPlayer
 end
 
-function M.ensureBeamBetween(localHRP, enemyHRP, id)
-    -- tạo Beam / Attachment
-end
-
-function M.removeBeamForPlayer(id)
-    -- dọn beam
-end
-
--- optional: export update loop helper
-function M.updateAll()
-    -- gọi setupEnemyESP cho mọi player, manage beams theo Config
-end
-
-return M
-
+return ESP
