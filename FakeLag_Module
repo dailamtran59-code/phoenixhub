@@ -1,0 +1,594 @@
+-- ============================================================
+-- FakeLag Module v3.0 — Comprehensive Roblox Exploit System
+-- ============================================================
+-- Features: SimPing, Position Jitter, Burst Mode, Lag Ghost
+-- Requires: hookmetamethod, checkcaller (optional: Drawing API)
+-- Architecture per spec sections 1-12
+-- ============================================================
+
+local FakeLagModule = (function()
+
+-- ── [1] EXECUTOR CAPABILITY DETECTION ─────────────────────
+local hasHook    = type(hookmetamethod) == "function"
+local hasCheck   = type(checkcaller)    == "function"
+local hasDrawing = type(Drawing)        == "table"
+local hasGC      = type(getgc)          == "function"
+
+-- ── [2] SERVICE ALIASES ────────────────────────────────────
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+local LP         = Players.LocalPlayer
+
+local rand   = math.random
+local max    = math.max
+local clamp  = math.clamp
+local insert = table.insert
+local unpack = table.unpack
+local tw     = task.wait
+local tspawn = task.spawn
+local tick   = tick
+local pcall  = pcall
+
+-- ── [3] CONFIGURATION TABLE ────────────────────────────────
+-- All FakeLag settings. Mirror these into your main Config table.
+local Config = {
+    FakeLag = {
+        Enabled    = false,
+        -- SimPing: Packet Delay
+        SimPing    = true,
+        PingMs     = 150,
+        PingJitter = 30,
+        -- Position Jitter
+        PosJitter  = false,
+        JitterAmt  = 0.08,
+        -- Burst Mode
+        BurstMode  = false,
+        BurstHold  = 0.20,
+        BurstFire  = 0.05,
+        -- Lag Ghost
+        GhostShow  = false,
+        GhostTrans = 0.65,
+        GhostColor = Color3.fromRGB(120, 180, 255),
+    }
+}
+
+-- ── [4] STATE VARIABLES ────────────────────────────────────
+local FL_Thread       = nil   -- sentinel: true when system is running
+local FL_CancelToken  = nil   -- { dead = bool } cancellation token
+local FL_QueueActive  = false -- true = Burst Hold phase (do NOT fire)
+local FL_JitterThread = nil
+local FL_GhostThread  = nil
+local FL_GhostModel   = nil
+
+-- ── [5] PACKET QUEUE (Simple Array Queue) ──────────────────
+-- Uses head/tail indices. No table.remove(t,1) O(n) shifts.
+-- Compact runs amortized O(1) when head > 64.
+local PacketQueue = { data = {}, head = 1, tail = 0 }
+
+local function Q_Push(q, pkt)
+    q.tail = q.tail + 1
+    q.data[q.tail] = pkt
+end
+
+local function Q_IsEmpty(q)
+    return q.head > q.tail
+end
+
+local function Q_Compact(q)
+    local newdata, n = {}, 0
+    for i = q.head, q.tail do
+        if q.data[i] then
+            n = n + 1
+            newdata[n] = q.data[i]
+        end
+    end
+    q.data = newdata
+    q.head = 1
+    q.tail = n
+end
+
+local function Q_Reset(q)
+    q.data = {}
+    q.head = 1
+    q.tail = 0
+end
+
+-- ── [6] FL_QueuePacket ─────────────────────────────────────
+-- Called from __namecall hook. Returns true if packet was queued
+-- (so hook can return nil and suppress the original FireServer call).
+-- NEVER called for InvokeServer — that must pass through immediately.
+local function FL_QueuePacket(fn)
+    if not Config.FakeLag.Enabled or not Config.FakeLag.SimPing then
+        return false
+    end
+    local jMs    = Config.FakeLag.PingJitter
+    local delay  = Config.FakeLag.PingMs + rand(-jMs, jMs)
+    local fireAt = tick() + max(0.005, delay / 1000)
+    Q_Push(PacketQueue, { fn = fn, fireAt = fireAt })
+    return true
+end
+
+-- ── [7] HOOK __namecall ────────────────────────────────────
+-- Only install if executor supports hookmetamethod + checkcaller.
+local OldNC
+if hasHook and hasCheck then
+    OldNC = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+
+        -- SimPing: only FireServer, NEVER InvokeServer
+        if not checkcaller()
+            and Config.FakeLag.Enabled
+            and Config.FakeLag.SimPing
+            and method == "FireServer" then
+            local _self = self
+            local _args = {...}
+            local queued = FL_QueuePacket(function()
+                OldNC(_self, unpack(_args))
+            end)
+            if queued then return nil end
+        end
+
+        return OldNC(self, ...)
+    end)
+end
+
+-- ── [8] PACKET WORKER THREAD ───────────────────────────────
+-- Runs every Heartbeat. Respects FL_QueueActive:
+--   true  → Burst Hold phase: do NOT fire anything.
+--   false → fire all packets whose fireAt <= now.
+-- On token.dead: flush remaining packets then reset queue.
+local function StartPacketWorker(token)
+    tspawn(function()
+        while not token.dead do
+            local now = tick()
+            local q   = PacketQueue
+
+            -- Amortized compact
+            if q.head > 64 then Q_Compact(q) end
+            if Q_IsEmpty(q) then Q_Reset(q) end
+
+            -- [BUG-1 FIX] Only fire when NOT in Burst Hold
+            if not FL_QueueActive then
+                local newHead = q.tail + 1
+                for i = q.head, q.tail do
+                    if token.dead then break end
+                    local pkt = q.data[i]
+                    if pkt then
+                        if now >= pkt.fireAt then
+                            pcall(pkt.fn)
+                            q.data[i] = nil
+                        else
+                            if i < newHead then newHead = i end
+                        end
+                    end
+                end
+                q.head = newHead
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+
+        -- Flush remaining packets on stop (prevent data loss)
+        local q = PacketQueue
+        for i = q.head, q.tail do
+            local pkt = q.data[i]
+            if pkt then pcall(pkt.fn) end
+        end
+        Q_Reset(q)
+    end)
+end
+
+-- ── [9] BURST CYCLE THREAD ─────────────────────────────────
+-- Alternates FL_QueueActive:
+--   Hold phase (true):  packets accumulate → creates spike
+--   Fire phase (false): worker fires all queued packets at once
+local function StartBurstCycle(token)
+    tspawn(function()
+        while not token.dead and Config.FakeLag.BurstMode do
+            FL_QueueActive = true           -- Accumulate
+            tw(Config.FakeLag.BurstHold)
+            if token.dead then break end
+            FL_QueueActive = false          -- Release burst
+            tw(Config.FakeLag.BurstFire)
+        end
+        FL_QueueActive = false
+    end)
+end
+
+-- ── [10] POSITION JITTER THREAD ────────────────────────────
+-- [BUG-3 FIX]:
+--   • Saves original AssemblyLinearVelocity before adding noise.
+--   • Noise only on X/Z (Y = 0) — preserves gravity component.
+--   • Restores savedVel (not Vector3.zero) when jitter ends.
+local function StartJitter(token)
+    if FL_JitterThread then return end
+    FL_JitterThread = tspawn(function()
+        local jitterOn = false
+        local savedVel = nil
+
+        while not token.dead and Config.FakeLag.PosJitter do
+            local lpChar = LP.Character
+            local hrp    = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+
+            if hrp then
+                if rand() < Config.FakeLag.JitterAmt then
+                    if not jitterOn then
+                        -- Save original velocity (includes gravity Y)
+                        pcall(function() savedVel = hrp.AssemblyLinearVelocity end)
+                        -- Apply horizontal-only noise (Y = 0 always)
+                        local mag = 12 + rand() * 8  -- 12-20 studs/s
+                        local noise = Vector3.new(
+                            (rand() * 2 - 1) * mag,
+                            0,
+                            (rand() * 2 - 1) * mag
+                        )
+                        pcall(function()
+                            hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity + noise
+                        end)
+                        jitterOn = true
+                    end
+                else
+                    if jitterOn then
+                        -- Restore original velocity — NOT Vector3.zero
+                        pcall(function()
+                            if savedVel then
+                                hrp.AssemblyLinearVelocity = savedVel
+                            end
+                        end)
+                        savedVel = nil
+                        jitterOn = false
+                    end
+                end
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+
+        -- Cleanup: restore if still jittering when thread exits
+        if jitterOn and savedVel then
+            local lpChar = LP.Character
+            local hrp    = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function() hrp.AssemblyLinearVelocity = savedVel end)
+            end
+        end
+
+        FL_JitterThread = nil
+    end)
+end
+
+-- ── [11] LAG GHOST ─────────────────────────────────────────
+-- Creates a semi-transparent anchored clone of the local character
+-- positioned at its delayed CFrame (simulating what the server sees).
+
+local function DestroyGhost()
+    if FL_GhostModel then
+        pcall(function() FL_GhostModel:Destroy() end)
+        FL_GhostModel = nil
+    end
+end
+
+-- [FIX-4] Only clone direct BasePart children (skip Accessory/Hat/Tool)
+-- This prevents ~60% extra parts from accessories from causing lag.
+local function CreateGhost(sourceChar)
+    DestroyGhost()
+    if not sourceChar then return nil end
+
+    local SKIP = { Accessory=true, Hat=true, Tool=true,
+                   Script=true, LocalScript=true, ModuleScript=true }
+
+    local ok, ghost = pcall(function()
+        local g    = Instance.new("Model")
+        g.Name     = "_FL_Ghost"
+        local trans = Config.FakeLag.GhostTrans
+        local color = Config.FakeLag.GhostColor
+        local MAT   = Enum.Material.ForceField
+
+        for _, part in ipairs(sourceChar:GetChildren()) do
+            if part:IsA("BasePart") and not SKIP[part.ClassName] then
+                local clone = Instance.new("Part")
+                clone.Name         = part.Name
+                clone.Size         = part.Size
+                clone.CFrame       = part.CFrame
+                clone.Anchored     = true
+                clone.CanCollide   = false
+                clone.CanTouch     = false
+                clone.CanQuery     = false
+                clone.CastShadow   = false
+                clone.Material     = MAT
+                clone.Color        = color
+                -- HRP itself fully transparent (anchor only)
+                clone.Transparency = (part.Name == "HumanoidRootPart") and 1 or trans
+
+                -- Copy SpecialMesh to preserve body shape
+                local mesh = part:FindFirstChildOfClass("SpecialMesh")
+                          or part:FindFirstChildOfClass("DataModelMesh")
+                if mesh then mesh:Clone().Parent = clone end
+
+                clone.Parent = g
+            end
+        end
+
+        -- Set PrimaryPart for world-transform math
+        local hrpClone = g:FindFirstChild("HumanoidRootPart")
+        if hrpClone then g.PrimaryPart = hrpClone end
+
+        g.Parent = Workspace
+        return g
+    end)
+
+    if ok and ghost then
+        FL_GhostModel = ghost
+        return ghost
+    end
+    return nil
+end
+
+-- [FIX-5] World-space delta transform:
+--   delta = delayCF * srcHRP.CFrame:Inverse()
+--   Apply: ghostPart.CFrame = delta * srcPart.CFrame
+-- This is correct for ALL rotation states (avoids relative offset math errors).
+local function UpdateGhostCFrame(sourceChar, ghost, delayCF)
+    if not sourceChar or not ghost then return end
+    local srcHRP = sourceChar:FindFirstChild("HumanoidRootPart")
+    if not srcHRP then return end
+
+    local delta = delayCF * srcHRP.CFrame:Inverse()
+
+    for _, gPart in ipairs(ghost:GetChildren()) do
+        if gPart:IsA("BasePart") then
+            local srcPart = sourceChar:FindFirstChild(gPart.Name)
+            if srcPart and srcPart:IsA("BasePart") then
+                pcall(function()
+                    gPart.CFrame = delta * srcPart.CFrame
+                end)
+            end
+        end
+    end
+end
+
+-- Ghost thread: records HRP CFrame history (3 sec buffer),
+-- lerps to the delayed position each Heartbeat.
+local function StartGhostThread(token)
+    if FL_GhostThread then return end
+    FL_GhostThread = tspawn(function()
+        local history   = {}       -- { { t=tick(), cf=CFrame }, ... }
+        local MAX_HIST  = 3.0      -- seconds of history to keep
+        local ghost     = nil
+        local rebuildCD = 0
+
+        while not token.dead and Config.FakeLag.Enabled do
+            local now    = tick()
+            local lpChar = LP.Character
+            local hrp    = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+
+            if hrp and Config.FakeLag.GhostShow then
+                -- Record current CFrame
+                insert(history, { t = now, cf = hrp.CFrame })
+
+                -- Prune entries older than MAX_HIST seconds
+                local cutoff = now - MAX_HIST
+                while #history > 2 and history[1].t < cutoff do
+                    table.remove(history, 1)
+                end
+
+                -- (Re)build ghost model if missing
+                if (not ghost or not ghost.Parent) and now > rebuildCD then
+                    ghost = CreateGhost(lpChar)
+                    rebuildCD = now + 2.0
+                end
+
+                -- Compute playback time = now minus simulated ping
+                local delayS   = Config.FakeLag.PingMs / 1000
+                local playTime = now - delayS
+
+                -- Binary-ish search for surrounding samples
+                local before, after = nil, nil
+                for i = #history, 1, -1 do
+                    if history[i].t <= playTime then
+                        before = history[i]
+                        if i < #history then after = history[i + 1] end
+                        break
+                    end
+                end
+
+                if before and ghost then
+                    local delayCF
+                    if after then
+                        local span  = after.t - before.t
+                        local alpha = (span > 0.001)
+                            and clamp((playTime - before.t) / span, 0, 1) or 0
+                        delayCF = before.cf:Lerp(after.cf, alpha)
+                    else
+                        delayCF = before.cf
+                    end
+                    UpdateGhostCFrame(lpChar, ghost, delayCF)
+                end
+
+                -- Live-update transparency & color (responds to UI changes)
+                if ghost then
+                    local trans = Config.FakeLag.GhostTrans
+                    local color = Config.FakeLag.GhostColor
+                    for _, gPart in ipairs(ghost:GetChildren()) do
+                        if gPart:IsA("BasePart") and gPart.Name ~= "HumanoidRootPart" then
+                            if gPart.Transparency ~= trans then gPart.Transparency = trans end
+                            if gPart.Color ~= color        then gPart.Color = color end
+                        end
+                    end
+                end
+
+            else
+                -- GhostShow disabled or no character → clean up
+                if ghost and ghost.Parent then
+                    DestroyGhost()
+                    ghost = nil
+                end
+                history = {}
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+
+        -- Cleanup on thread exit
+        DestroyGhost()
+        ghost   = nil
+        history = nil
+        FL_GhostThread = nil
+    end)
+end
+
+-- ── [12] START / STOP LIFECYCLE ────────────────────────────
+local function StartFakeLag()
+    if FL_Thread then return end  -- already running
+
+    FL_CancelToken = { dead = false }
+    Q_Reset(PacketQueue)
+    FL_QueueActive = false
+
+    -- Packet worker always runs (needed even without BurstMode)
+    StartPacketWorker(FL_CancelToken)
+
+    -- Conditional threads based on config
+    if Config.FakeLag.BurstMode then StartBurstCycle(FL_CancelToken) end
+    if Config.FakeLag.PosJitter then StartJitter(FL_CancelToken)     end
+
+    -- Ghost thread always starts; it self-gates on GhostShow flag
+    StartGhostThread(FL_CancelToken)
+
+    FL_Thread = true
+end
+
+local function StopFakeLag()
+    Config.FakeLag.Enabled = false
+    FL_QueueActive = false
+
+    if FL_CancelToken then
+        FL_CancelToken.dead = true  -- All threads detect this and exit
+        FL_CancelToken = nil
+    end
+
+    DestroyGhost()
+
+    FL_Thread       = nil
+    FL_JitterThread = nil
+    FL_GhostThread  = nil
+end
+
+-- ── [13] PUBLIC API ────────────────────────────────────────
+return {
+    Config       = Config,
+    Start        = StartFakeLag,
+    Stop         = StopFakeLag,
+    DestroyGhost = DestroyGhost,
+    CreateGhost  = CreateGhost,
+    QueuePacket  = FL_QueuePacket,
+    GetQueue     = function() return PacketQueue end,
+    FlushQueue   = function()
+        local q = PacketQueue
+        local n = 0
+        FL_QueueActive = false
+        for i = q.head, q.tail do
+            local pkt = q.data[i]
+            if pkt then pcall(pkt.fn); n = n + 1 end
+        end
+        Q_Reset(q)
+        return n
+    end,
+    QueueSize = function()
+        local q, n = PacketQueue, 0
+        for i = q.head, q.tail do
+            if q.data[i] then n = n + 1 end
+        end
+        return n
+    end,
+    IsRunning = function() return FL_Thread == true end,
+    -- Executor capability flags (read-only for UI display)
+    Caps = {
+        hookmetamethod = hasHook,
+        checkcaller    = hasCheck,
+        Drawing        = hasDrawing,
+        getgc          = hasGC,
+    },
+}
+
+end)()
+
+-- ============================================================
+-- INTEGRATION GUIDE
+-- ============================================================
+--
+-- 1. BASIC START/STOP:
+--      FakeLagModule.Config.FakeLag.Enabled = true
+--      FakeLagModule.Start()
+--      -- ... later:
+--      FakeLagModule.Stop()
+--
+-- 2. RAYFIELD TOGGLE EXAMPLE:
+--      T_FakeLag:CreateToggle({ Name="Enable FakeLag",
+--          CurrentValue = false, Flag = "FL_En",
+--          Callback = function(v)
+--              FakeLagModule.Config.FakeLag.Enabled = v
+--              if v then FakeLagModule.Start() else FakeLagModule.Stop() end
+--          end })
+--
+-- 3. PING SLIDER EXAMPLE:
+--      T_FakeLag:CreateSlider({ Name="Simulated Ping (ms)",
+--          Range={50,500}, Increment=10, Suffix="ms",
+--          CurrentValue=150, Flag="FL_PMs",
+--          Callback=function(v)
+--              FakeLagModule.Config.FakeLag.PingMs = v
+--          end })
+--
+-- 4. BURST MODE TOGGLE (requires restart to take effect):
+--      T_FakeLag:CreateToggle({ Name="Burst Mode", Flag="FL_Burst",
+--          Callback=function(v)
+--              FakeLagModule.Config.FakeLag.BurstMode = v
+--              if FakeLagModule.IsRunning() then
+--                  FakeLagModule.Stop()
+--                  FakeLagModule.Config.FakeLag.Enabled = true
+--                  FakeLagModule.Start()
+--              end
+--          end })
+--
+-- 5. GHOST TOGGLE:
+--      T_FakeLag:CreateToggle({ Name="Lag Ghost", Flag="FL_Ghost",
+--          Callback=function(v)
+--              FakeLagModule.Config.FakeLag.GhostShow = v
+--              if not v then FakeLagModule.DestroyGhost() end
+--          end })
+--
+-- 6. FLUSH BUTTON:
+--      T_FakeLag:CreateButton({ Name="Flush Queue",
+--          Callback=function()
+--              local n = FakeLagModule.FlushQueue()
+--              Rayfield:Notify({Title="Flushed",
+--                  Content=n.." packets sent.", Duration=3})
+--          end })
+--
+-- 7. STATUS BUTTON:
+--      T_FakeLag:CreateButton({ Name="Queue Status",
+--          Callback=function()
+--              local cfg = FakeLagModule.Config.FakeLag
+--              Rayfield:Notify({
+--                  Title="FakeLag Status",
+--                  Content=string.format(
+--                      "Queue: %d pkts\nPing: %dms ±%dms\nBurst: %s | Jitter: %s\nGhost: %s",
+--                      FakeLagModule.QueueSize(),
+--                      cfg.PingMs, cfg.PingJitter,
+--                      cfg.BurstMode and "ON" or "OFF",
+--                      cfg.PosJitter and "ON" or "OFF",
+--                      cfg.GhostShow and "ON" or "OFF"),
+--                  Duration=5 })
+--          end })
+--
+-- ============================================================
+-- KNOWN BUGS FIXED (per spec section 10):
+-- [BUG-1] Burst: Worker now checks FL_QueueActive each frame.
+-- [BUG-2] Queue: array+head/tail+compact replaces ring-buffer.
+-- [BUG-3] Jitter: saves/restores original velocity, Y=0 noise.
+-- [FIX-4] Ghost: GetChildren() only, skips Accessory/Hat/Tool.
+-- [FIX-5] Ghost: world-space delta transform (not relative offset).
+-- ============================================================
+
+return FakeLagModule
