@@ -74,6 +74,60 @@ local function jWait(base, v)
     tw(t); return t
 end
 
+-- ── Universal Team Check ─────────────────────────────────────────────────────
+-- Kiểm tra xem targetPlayer và localPlayer có cùng team hay không,
+-- hỗ trợ đầy đủ: Roblox default Team, TeamColor, custom Attribute, StringValue.
+-- Trả về TRUE nếu cùng team, FALSE nếu là kẻ địch.
+local function IsSameTeam(targetPlayer, localPlayer)
+    if not targetPlayer or not localPlayer then return false end
+
+    -- [1] Roblox default Team object (Team ~= nil means they have a team)
+    local ok1, lpTeam  = pcall(function() return localPlayer.Team  end)
+    local ok2, tgtTeam = pcall(function() return targetPlayer.Team end)
+    if ok1 and ok2 then
+        if lpTeam ~= nil and tgtTeam ~= nil then
+            return lpTeam == tgtTeam
+        end
+    end
+
+    -- [2] TeamColor (fallback khi Team object nil nhưng BrickColor vẫn set)
+    local ok3, lpColor  = pcall(function() return localPlayer.TeamColor  end)
+    local ok4, tgtColor = pcall(function() return targetPlayer.TeamColor end)
+    if ok3 and ok4 and lpColor ~= nil and tgtColor ~= nil then
+        if lpColor ~= BrickColor.new("White") or tgtColor ~= BrickColor.new("White") then
+            -- Tránh false-positive khi cả 2 đều chưa được gán màu (mặc định trắng)
+            return lpColor == tgtColor
+        end
+    end
+
+    -- [3] Custom Attribute: "Team", "team", "TeamName"
+    local ATTR_KEYS = { "Team", "team", "TeamName" }
+    for _, key in ipairs(ATTR_KEYS) do
+        local okA, lpAttr  = pcall(function() return localPlayer:GetAttribute(key)  end)
+        local okB, tgtAttr = pcall(function() return targetPlayer:GetAttribute(key) end)
+        if okA and okB and lpAttr ~= nil and tgtAttr ~= nil then
+            return tostring(lpAttr) == tostring(tgtAttr)
+        end
+    end
+
+    -- [4] StringValue children named "Team" hoặc "team"
+    local STR_KEYS = { "Team", "team" }
+    for _, key in ipairs(STR_KEYS) do
+        local lpSV  = localPlayer:FindFirstChild(key)
+        local tgtSV = targetPlayer:FindFirstChild(key)
+        if lpSV and tgtSV
+            and lpSV:IsA("StringValue")
+            and tgtSV:IsA("StringValue")
+            and lpSV.Value ~= "" then
+            return lpSV.Value == tgtSV.Value
+        end
+    end
+
+    -- Không tìm thấy thông tin team chung → xác nhận là kẻ địch
+    return false
+end
+-- ─────────────────────────────────────────────────────────────────────────────
+
 -- XOR Obfuscation (dùng bit32.bxor để tương thích mọi executor Roblox)
 local OBF_KEY = 0x3F
 local _bxor = bit32 and bit32.bxor or function(a, b)
@@ -315,6 +369,10 @@ local Config = {
         BurstMode = false,       -- Gom packets → xả burst → tạo spike ping
         BurstHold = 0.20,        -- Thời gian GOM packet (s)
         BurstFire = 0.05,        -- Thời gian XẢ packet (s)
+        -- ── Lag Ghost (ảo ảnh lag) ──
+        GhostShow  = false,      -- Hiển thị bóng ma vị trí lag phía sau bạn
+        GhostTrans = 0.65,       -- Độ trong suốt ghost (0=đặc, 1=ẩn hoàn toàn)
+        GhostColor = Color3.fromRGB(120, 180, 255),  -- Màu tint của ghost
     },
     -- ─── Misc ───
     Misc = {
@@ -347,6 +405,8 @@ local FL_FrozenCF  = nil
 local FL_PacketQueue = {}
 local FL_QueueActive = false  -- true khi đang trong burst-hold (chặn packets)
 local FL_JitterThread = nil
+local FL_GhostModel   = nil   -- Model clone bán trong suốt (lag ghost)
+local FL_GhostThread  = nil   -- Thread cập nhật vị trí ghost
 local TB_Firing    = false
 local TB_Held      = false
 local _origSpeed   = 16
@@ -863,7 +923,6 @@ local function UpdateESP()
     if not Config.ESP.Enabled then return end
     local cfg        = Config.ESP
     local allPlayers = Players:GetPlayers()
-    local lTeam      = LP.Team
     local camPos     = Camera.CFrame.Position
     local vp         = Camera.ViewportSize
 
@@ -874,7 +933,7 @@ local function UpdateESP()
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         local head = char and char:FindFirstChild("Head")
-        local isEnemy = not cfg.TeamCheck or p.Team ~= lTeam
+        local isEnemy = not cfg.TeamCheck or not IsSameTeam(p, LP)
         local valid   = hum and hum.Health > 0 and hrp and head and isEnemy
 
         -- ── Highlight (Chams 3D) ──
@@ -1106,7 +1165,7 @@ local function GetTarget()
 
     for _, p in ipairs(Players:GetPlayers()) do
         if p == LP then continue end
-        if Config.Aim.TeamCheck and p.Team == LP.Team then continue end
+        if Config.Aim.TeamCheck and IsSameTeam(p, LP) then continue end
         local char = p.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         local part = char and char:FindFirstChild(Config.Aim.AimPart)
@@ -1136,7 +1195,7 @@ local function GetNearest3D(maxDist)
     local best, bestP, bestDist = nil, nil, maxDist
     for _, p in ipairs(Players:GetPlayers()) do
         if p == LP then continue end
-        if Config.Aim.TeamCheck and p.Team == LP.Team then continue end
+        if Config.Aim.TeamCheck and IsSameTeam(p, LP) then continue end
         local char = p.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
@@ -1156,7 +1215,7 @@ local function IsCrosshairOnEnemy()
     local camPos = Camera.CFrame.Position
     for _, p in ipairs(Players:GetPlayers()) do
         if p == LP then continue end
-        if Config.TriggerBot.TeamCheck and p.Team == LP.Team then continue end
+        if Config.TriggerBot.TeamCheck and IsSameTeam(p, LP) then continue end
         local char = p.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         local part = char and (char:FindFirstChild(Config.TriggerBot.Hitbox) or char:FindFirstChild("Head"))
@@ -1260,60 +1319,80 @@ local function StartInfStamina()
 end
 
 -- ════════════════════════════════════════════════════════════
--- [18] FAKELAG v2 — Packet Delay + Jitter + Burst  (OPTIMIZED)
+-- [18] FAKELAG v2 — Packet Delay + Jitter + Burst  (FIXED v5.2.1)
 -- ════════════════════════════════════════════════════════════
 --
--- TÓM TẮT 4 THAY ĐỔI TỐI ƯU:
+-- TÓM TẮT 3 LỖI ĐÃ SỬA:
 --
---  [FIX-1] InvokeServer không bao giờ bị queue (xem hook [11]).
+--  [BUG-1] Burst Mode không hoạt động:
+--          FL_QueueActive được set bởi BurstCycle nhưng Worker KHÔNG
+--          kiểm tra nó → packets luôn được fire ngay, burst vô nghĩa.
+--    FIX → Worker chỉ fire khi FL_QueueActive == false (pha Fire).
+--          Khi FL_QueueActive == true (pha Hold), packets chỉ nằm chờ.
 --
---  [FIX-2] Ring-Buffer Queue thay cho mảng đơn:
---          FL_PacketQueue là bảng {data, head, tail, size}.
---          Thêm phần tử: tail++ và ghi slot.        O(1) amortized
---          Lấy+xóa phần tử đầu: head++.            O(1) guaranteed
---          Không bao giờ gọi table.remove(t, 1) → không O(n) shift.
---          Worker duyệt từ head đến tail; các slot đã gửi bị skip.
+--  [BUG-2] Ring-Buffer phình index + bỏ sót gói out-of-order:
+--          head = i + 1 nhảy cóc qua các slot có fireAt muộn hơn,
+--          và data table phình vô hạn vì index chỉ tăng không giảm.
+--    FIX → Dùng simple array queue + compact khi head > 64:
+--          duyệt head→tail, fire gói đến hạn, xóa slot đó;
+--          compact bằng cách dồn data[] về [1..n] khi head quá lớn.
 --
---  [FIX-3] Position Jitter dùng AssemblyLinearVelocity thay CFrame:
---          Thay vì freeze CFrame (làm player giật màn hình),
---          ta cộng thêm một velocity ngẫu nhiên ngắn → server thấy
---          nhân vật teleport/lồng ở phía server, client vẫn mượt.
---          Reset velocity về 0 ngay frame tiếp để không bay người.
+--  [BUG-3] Jitter ép Vector3.zero → mất trọng lực, không nhảy được:
+--          Reset velocity = zero xóa cả thành phần Y (gravity).
+--    FIX → Lưu oldVel trước khi cộng noise, reset về oldVel (không
+--          phải zero). Noise chỉ trên X/Z (Y luôn = 0).
 --
---  [FIX-4] Cancellation token (FL_CancelToken) để stop thread ngay:
---          Mỗi lần StartFakeLag() tạo token mới (table object).
---          Thread giữ upvalue tới token đó; khi StopFakeLag() gọi,
---          token.dead = true → thread break ngay lập tức ở Heartbeat.
---          Không còn thread zombie chờ biến Config thay đổi.
+--  [GIỮ NGUYÊN] FL_CancelToken + cấu trúc giao tiếp UI (StartFakeLag/
+--               StopFakeLag) + InvokeServer bypass (xem hook [11]).
 -- ════════════════════════════════════════════════════════════
 
--- ── Ring-Buffer Queue ──────────────────────────────────────
--- Cấu trúc: FL_PacketQueue = { data = {}, head = 1, tail = 0, size = 0 }
--- Không dùng table.remove(t, i) → O(1) push/pop
-local function RB_New()
-    return { data = {}, head = 1, tail = 0, size = 0 }
+-- ── Simple Array Queue (thay Ring-Buffer tự chế) ───────────
+-- Cấu trúc: { data = {}, head = 1, tail = 0 }
+--   • Push: tail++, data[tail] = item                    O(1)
+--   • Fire: data[i] = nil (gán rỗng slot đã gửi)        O(1)
+--   • Compact: khi head > 64, dồn data[] về [1..n]       O(n) amortized
+-- Không dùng table.remove(t,1) tránh O(n) shift mỗi lần pop.
+-- ───────────────────────────────────────────────────────────
+
+local function Q_New()
+    return { data = {}, head = 1, tail = 0 }
 end
 
-local function RB_Push(rb, item)
-    rb.tail        = rb.tail + 1
-    rb.data[rb.tail] = item
-    rb.size        = rb.size + 1
+local function Q_Push(q, item)
+    q.tail           = q.tail + 1
+    q.data[q.tail]   = item
 end
 
-local function RB_PopHead(rb)
-    -- Xóa phần tử ở head (đã được gửi) bằng cách tăng head
-    rb.data[rb.head] = nil   -- GC slot
-    rb.head          = rb.head + 1
-    rb.size          = rb.size - 1
+local function Q_IsEmpty(q)
+    -- Queue rỗng khi mọi slot từ head→tail đều nil hoặc head > tail
+    return q.head > q.tail
 end
 
--- Reset sạch (khi stop): tạo lại bảng mới thay vì loop xóa
-local function RB_Reset(rb)
-    rb.data = {}; rb.head = 1; rb.tail = 0; rb.size = 0
+--- Compact: dồn các phần tử còn sống về [1..n] để chống phình index.
+--- Chỉ gọi khi head > 64 (amortized O(1) trung bình).
+local function Q_Compact(q)
+    local newData = {}
+    local n = 0
+    for i = q.head, q.tail do
+        if q.data[i] then
+            n = n + 1
+            newData[n] = q.data[i]
+        end
+    end
+    q.data = newData
+    q.head = 1
+    q.tail = n
 end
 
--- Khởi tạo queue ngay khi load (thay FL_PacketQueue = {})
-FL_PacketQueue = RB_New()
+--- Reset sạch (khi stop FakeLag): tạo lại bảng mới
+local function Q_Reset(q)
+    q.data = {}
+    q.head = 1
+    q.tail = 0
+end
+
+-- Khởi tạo queue ngay khi load
+FL_PacketQueue = Q_New()
 
 -- ── Cancellation Token ─────────────────────────────────────
 -- Token là 1 table {dead=bool}. Worker giữ upvalue → check mỗi frame.
@@ -1330,57 +1409,92 @@ local function FL_QueuePacket(fn)
     local jitterMs = Config.FakeLag.PingJitter
     local delayMs  = Config.FakeLag.PingMs + rand(-jitterMs, jitterMs)
     local fireAt   = tick() + max(0.005, delayMs / 1000)
-    RB_Push(FL_PacketQueue, { fn = fn, fireAt = fireAt })
+    Q_Push(FL_PacketQueue, { fn = fn, fireAt = fireAt })
     return true
 end
 
 -- ── Worker Thread: gửi packets đúng lúc ────────────────────
--- [FIX-2]: Không dùng table.remove. Duyệt toàn bộ ring-buffer,
---          slot nào đến giờ thì pcall + RB_PopHead ngay (head++),
---          slot chưa đến giờ thì để nguyên → next iteration.
---          Complexity: O(n_due) thay vì O(n_total) mỗi frame.
+-- [BUG-1 FIX]: Worker kiểm tra FL_QueueActive mỗi frame:
+--   • FL_QueueActive == true  (Burst Hold) → KHÔNG fire, chỉ chờ.
+--   • FL_QueueActive == false (Burst Fire / SimPing thuần) → fire
+--     tất cả gói đến hạn fireAt.
+-- [BUG-2 FIX]: Duyệt head→tail, fire bất kỳ slot nào đến hạn
+--   (không phụ thuộc thứ tự index), xóa slot bằng gán nil.
+--   Compact khi head > 64 để chống phình memory.
 local function StartPacketWorker(token)
     tspawn(function()
         while not token.dead do
             local now = tick()
-            -- Duyệt từ head đến tail; các slot đã fire được pop
-            local h = FL_PacketQueue.head
-            local t = FL_PacketQueue.tail
-            local d = FL_PacketQueue.data
-            -- Reset lại head nếu buffer trống để tránh index phình
-            if FL_PacketQueue.size == 0 then
-                RB_Reset(FL_PacketQueue)
-                h = 1; t = 0
+            local q   = FL_PacketQueue
+
+            -- Compact nếu head đã trôi quá xa → chống phình index/memory
+            if q.head > 64 then
+                Q_Compact(q)
             end
-            for i = h, t do
-                if token.dead then break end
-                local pkt = d[i]
-                if pkt and now >= pkt.fireAt then
-                    pcall(pkt.fn)
-                    d[i] = nil          -- xóa slot, tăng head
-                    FL_PacketQueue.head = i + 1
-                    FL_PacketQueue.size = FL_PacketQueue.size - 1
+
+            -- Nếu queue rỗng hoàn toàn → reset về trạng thái ban đầu
+            if Q_IsEmpty(q) then
+                Q_Reset(q)
+            end
+
+            -- ┌──────────────────────────────────────────────┐
+            -- │ [BUG-1 FIX] Chỉ fire khi KHÔNG trong burst  │
+            -- │ hold. FL_QueueActive == true → bỏ qua frame  │
+            -- │ này, packets nằm yên trong queue chờ xả.     │
+            -- └──────────────────────────────────────────────┘
+            if not FL_QueueActive then
+                -- Duyệt toàn bộ head→tail, fire bất kỳ gói nào đến hạn
+                -- (duyệt hết, KHÔNG break sớm → xử lý out-of-order fireAt)
+                local newHead = q.tail + 1  -- giả sử mọi thứ đã xử lý
+                for i = q.head, q.tail do
+                    if token.dead then break end
+                    local pkt = q.data[i]
+                    if pkt then
+                        if now >= pkt.fireAt then
+                            -- Gói đến hạn → fire ngay
+                            pcall(pkt.fn)
+                            q.data[i] = nil  -- xóa slot đã gửi
+                        else
+                            -- Gói chưa đến hạn → slot vẫn còn sống
+                            -- Cập nhật newHead = slot sống đầu tiên
+                            if i < newHead then
+                                newHead = i
+                            end
+                        end
+                    end
                 end
-                -- Slot chưa đến giờ: để nguyên, next frame sẽ check lại
+                -- Cập nhật head = slot sống đầu tiên còn lại
+                q.head = newHead
             end
+            -- Nếu FL_QueueActive == true: không làm gì, packets tiếp
+            -- tục được Q_Push từ hook [11] và nằm chờ trong queue.
+
             RunService.Heartbeat:Wait()
         end
-        -- Flush queue còn lại khi token.dead (StopFakeLag)
-        local d = FL_PacketQueue.data
-        for i = FL_PacketQueue.head, FL_PacketQueue.tail do
-            if d[i] then pcall(d[i].fn) end
+
+        -- ── Flush queue còn lại khi token.dead (StopFakeLag) ──
+        -- Gửi hết mọi gói chưa fire để không mất packet quan trọng
+        local q = FL_PacketQueue
+        for i = q.head, q.tail do
+            local pkt = q.data[i]
+            if pkt then pcall(pkt.fn) end
         end
-        RB_Reset(FL_PacketQueue)
+        Q_Reset(q)
     end)
 end
 
 -- ── Burst Cycle Thread ─────────────────────────────────────
+-- Chu kỳ: Hold (FL_QueueActive=true) → Fire (FL_QueueActive=false)
+-- Khi Hold: worker bỏ qua fire → packets gom lại trong queue.
+-- Khi Fire: worker xả toàn bộ → tạo hiệu ứng spike ping.
 local function StartBurstCycle(token)
     tspawn(function()
         while not token.dead and Config.FakeLag.BurstMode do
+            -- ── Pha Hold: gom packets ──
             FL_QueueActive = true
             tw(Config.FakeLag.BurstHold)
             if token.dead then break end
+            -- ── Pha Fire: xả packets ──
             FL_QueueActive = false
             tw(Config.FakeLag.BurstFire)
         end
@@ -1389,27 +1503,32 @@ local function StartBurstCycle(token)
 end
 
 -- ── Position Jitter Thread ─────────────────────────────────
--- [FIX-3]: KHÔNG dùng hrp.CFrame = frozenCF (giật màn hình client).
---          Thay bằng AssemblyLinearVelocity: thêm xung lực ngẫu nhiên
---          ngắn vào hrp → phía server nhân vật "teleport" loạn,
---          phía client nhân vật vẫn di chuyển mượt vì physics render cục bộ.
---          Reset velocity = zero ngay frame sau để không bắn người đi xa.
+-- [BUG-3 FIX]:
+--   • Lưu oldVel = hrp.AssemblyLinearVelocity TRƯỚC khi cộng noise.
+--   • Noise chỉ trên trục X và Z (Y = 0) → KHÔNG ảnh hưởng trọng lực.
+--   • Reset về oldVel (không phải Vector3.zero) → giữ nguyên gravity
+--     và vận tốc di chuyển gốc, nhân vật vẫn nhảy và rơi bình thường.
 local function StartJitter(token)
     if FL_JitterThread then return end
     FL_JitterThread = tspawn(function()
         local jitterOn = false
+        local savedVel = nil  -- lưu vận tốc gốc trước khi cộng noise
         while not token.dead and Config.FakeLag.PosJitter do
             local lpChar = LP.Character
             local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
             if hrp then
                 if rand() < Config.FakeLag.JitterAmt then
                     if not jitterOn then
-                        -- Áp dụng xung lực ngẫu nhiên nhỏ (đủ để server thấy vị trí khác)
-                        -- AssemblyLinearVelocity không ảnh hưởng camera/input client
+                        -- [BUG-3 FIX] Lưu vận tốc gốc (bao gồm gravity Y)
+                        pcall(function()
+                            savedVel = hrp.AssemblyLinearVelocity
+                        end)
+                        -- Áp dụng xung lực ngẫu nhiên NHỎ trên X/Z
+                        -- Y = 0 tuyệt đối → KHÔNG bay lên trời
                         local mag = 12 + rand() * 8  -- 12-20 studs/s
                         local noise = Vector3.new(
                             (rand() * 2 - 1) * mag,
-                            0,
+                            0,                        -- ← Y luôn = 0
                             (rand() * 2 - 1) * mag
                         )
                         pcall(function()
@@ -1419,50 +1538,254 @@ local function StartJitter(token)
                     end
                 else
                     if jitterOn then
-                        -- Reset velocity ngay để client không bay
+                        -- [BUG-3 FIX] Khôi phục vận tốc gốc (KHÔNG reset zero)
+                        -- → Giữ nguyên trọng lực (Y) và momentum di chuyển
                         pcall(function()
-                            hrp.AssemblyLinearVelocity = Vector3.zero
+                            if savedVel then
+                                hrp.AssemblyLinearVelocity = savedVel
+                            end
                         end)
+                        savedVel = nil
                         jitterOn = false
                     end
                 end
             end
             RunService.Heartbeat:Wait()
         end
-        -- Cleanup khi thoát: chắc chắn reset velocity
-        local lpChar = LP.Character
-        local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
-        if hrp then pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end) end
+        -- Cleanup khi thoát: khôi phục velocity gốc nếu đang jitter
+        if jitterOn and savedVel then
+            local lpChar = LP.Character
+            local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function() hrp.AssemblyLinearVelocity = savedVel end)
+            end
+        end
         FL_JitterThread = nil
+    end)
+end
+
+-- ── Lag Ghost: ảo ảnh vị trí lag (chỉ bạn thấy) ──────────
+-- Tạo bản clone bán trong suốt của nhân vật, đặt ở vị trí
+-- "delay" (PingMs trước đó) để bạn biết kẻ địch nhìn thấy bạn ở đâu.
+-- Dùng position history buffer: ghi CFrame mỗi frame, playback
+-- tại thời điểm (now - PingMs) bằng lerp giữa 2 sample gần nhất.
+-- ───────────────────────────────────────────────────────────
+
+--- Hủy và xóa ghost model hiện tại
+local function DestroyGhost()
+    if FL_GhostModel then
+        pcall(function() FL_GhostModel:Destroy() end)
+        FL_GhostModel = nil
+    end
+end
+
+--- Tạo ghost model từ character hiện tại (đã lọc Accessories/Hats để tránh lag)
+-- [FIX-4] Chỉ clone BasePart con TRỰC TIẾP của character (body parts),
+--         bỏ qua toàn bộ descendants của Accessory/Hat/Tool.
+local function CreateGhost(sourceChar)
+    DestroyGhost()
+    if not sourceChar then return nil end
+
+    local ok, ghost = pcall(function()
+        local g = Instance.new("Model")
+        g.Name = "_FL_Ghost"
+
+        local trans = Config.FakeLag.GhostTrans
+        local color = Config.FakeLag.GhostColor
+        -- Material có thể đổi: ForceField cho hiệu ứng hologram, Neon cho glow
+        local MAT   = Enum.Material.ForceField
+
+        -- Tập hợp các class cần bỏ qua (Accessories, Tools, Scripts...)
+        local SKIP_CLASS = { Accessory=true, Tool=true, Script=true,
+                             LocalScript=true, ModuleScript=true, Hat=true }
+
+        for _, part in ipairs(sourceChar:GetChildren()) do
+            -- [FIX-4] Chỉ lấy children trực tiếp là BasePart (không đệ quy vào Accessory)
+            if part:IsA("BasePart") and not SKIP_CLASS[part.ClassName] then
+                local clone = Instance.new("Part")
+                clone.Name        = part.Name
+                clone.Size        = part.Size
+                clone.CFrame      = part.CFrame
+                clone.Anchored    = true
+                clone.CanCollide  = false
+                clone.CanTouch    = false
+                clone.CanQuery    = false
+                clone.CastShadow  = false
+                clone.Material    = MAT
+                clone.Color       = color
+                clone.Transparency = (part.Name == "HumanoidRootPart") and 1 or trans
+                -- Copy SpecialMesh nếu có (giữ hình dạng head/torso)
+                local mesh = part:FindFirstChildOfClass("SpecialMesh")
+                    or part:FindFirstChildOfClass("DataModelMesh")
+                if mesh then mesh:Clone().Parent = clone end
+                clone.Parent = g
+            end
+        end
+
+        -- PrimaryPart cho SetPrimaryPartCFrame
+        local hrpClone = g:FindFirstChild("HumanoidRootPart")
+        if hrpClone then g.PrimaryPart = hrpClone end
+
+        g.Parent = Workspace
+        return g
+    end)
+
+    if ok and ghost then
+        FL_GhostModel = ghost
+        return ghost
+    end
+    return nil
+end
+
+--- [FIX-5] Cập nhật vị trí từng part ghost theo world-space CFrame của source parts.
+--- Thay vì tính offset tương đối (dễ sai khi rotation), ta tính delta world-transform
+--- từ HRP source → HRP delay, rồi áp delta đó lên từng part.
+local function UpdateGhostCFrame(sourceChar, ghost, delayCF)
+    if not sourceChar or not ghost then return end
+    local srcHRP = sourceChar:FindFirstChild("HumanoidRootPart")
+    if not srcHRP then return end
+
+    -- Delta transform: delayCF * srcHRP.CFrame:Inverse()
+    -- → áp lên bất kỳ part nào: newCF = delta * part.CFrame
+    local delta = delayCF * srcHRP.CFrame:Inverse()
+
+    for _, gPart in ipairs(ghost:GetChildren()) do
+        if gPart:IsA("BasePart") then
+            local srcPart = sourceChar:FindFirstChild(gPart.Name)
+            if srcPart and srcPart:IsA("BasePart") then
+                -- [FIX-5] Dùng world-space delta, không dùng relative offset sai
+                pcall(function()
+                    gPart.CFrame = delta * srcPart.CFrame
+                end)
+            end
+        end
+    end
+end
+
+--- Thread chính: ghi position history + playback ghost ở vị trí delay.
+local function StartGhostThread(token)
+    if FL_GhostThread then return end
+    FL_GhostThread = tspawn(function()
+        -- Position History Buffer: { {time, CFrame}, ... }
+        -- Giữ tối đa 3 giây lịch sử (đủ cho PingMs ≤ 2000)
+        local history     = {}
+        local MAX_HISTORY  = 3.0  -- giây
+        local ghost       = nil
+        local rebuildCD   = 0     -- cooldown rebuild ghost model
+
+        while not token.dead and Config.FakeLag.Enabled do
+            local now    = tick()
+            local lpChar = LP.Character
+            local hrp    = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+
+            if hrp and Config.FakeLag.GhostShow then
+                -- ── Ghi CFrame hiện tại vào history ──
+                insert(history, { t = now, cf = hrp.CFrame })
+
+                -- ── Dọn history cũ (> MAX_HISTORY giây) ──
+                local cutoff = now - MAX_HISTORY
+                while #history > 2 and history[1].t < cutoff do
+                    -- Dùng table.remove(1) ở đây OK vì history nhỏ (~180 entries max)
+                    table.remove(history, 1)
+                end
+
+                -- ── Tạo/rebuild ghost model nếu chưa có ──
+                if (not ghost or not ghost.Parent) and now > rebuildCD then
+                    ghost = CreateGhost(lpChar)
+                    rebuildCD = now + 2.0  -- tránh spam rebuild
+                end
+
+                -- ── Tính thời điểm delay playback ──
+                local delayS   = Config.FakeLag.PingMs / 1000
+                local playTime = now - delayS
+
+                -- ── Tìm 2 sample gần nhất để lerp ──
+                local before, after = nil, nil
+                for i = #history, 1, -1 do
+                    if history[i].t <= playTime then
+                        before = history[i]
+                        if i < #history then
+                            after = history[i + 1]
+                        end
+                        break
+                    end
+                end
+
+                if before and ghost then
+                    local delayCF
+                    if after then
+                        -- Lerp giữa before và after
+                        local span  = after.t - before.t
+                        local alpha = (span > 0.001) and clamp((playTime - before.t) / span, 0, 1) or 0
+                        delayCF = before.cf:Lerp(after.cf, alpha)
+                    else
+                        delayCF = before.cf
+                    end
+                    -- Cập nhật ghost parts
+                    UpdateGhostCFrame(lpChar, ghost, delayCF)
+                end
+
+                -- Cập nhật transparency/color realtime (nếu user thay đổi qua UI)
+                if ghost then
+                    local trans = Config.FakeLag.GhostTrans
+                    local color = Config.FakeLag.GhostColor
+                    for _, gPart in ipairs(ghost:GetChildren()) do
+                        if gPart:IsA("BasePart") and gPart.Name ~= "HumanoidRootPart" then
+                            if gPart.Transparency ~= trans then gPart.Transparency = trans end
+                            if gPart.Color ~= color then gPart.Color = color end
+                        end
+                    end
+                end
+            else
+                -- Ghost disabled hoặc không có character → ẩn ghost
+                if ghost and ghost.Parent then
+                    DestroyGhost()
+                    ghost = nil
+                end
+                history = {}  -- reset history
+            end
+
+            RunService.Heartbeat:Wait()
+        end
+
+        -- Cleanup khi thoát
+        DestroyGhost()
+        ghost = nil
+        history = nil
+        FL_GhostThread = nil
     end)
 end
 
 -- ── StartFakeLag / StopFakeLag ────────────────────────────
 local function StartFakeLag()
     if FL_Thread then return end
-    -- [FIX-4]: Tạo cancellation token mới cho lần chạy này
+    -- Tạo cancellation token mới cho lần chạy này
     FL_CancelToken = { dead = false }
-    RB_Reset(FL_PacketQueue)
+    Q_Reset(FL_PacketQueue)
     FL_QueueActive = false
     StartPacketWorker(FL_CancelToken)
-    if Config.FakeLag.BurstMode then StartBurstCycle(FL_CancelToken) end
-    if Config.FakeLag.PosJitter  then StartJitter(FL_CancelToken)     end
+    if Config.FakeLag.BurstMode  then StartBurstCycle(FL_CancelToken)  end
+    if Config.FakeLag.PosJitter  then StartJitter(FL_CancelToken)      end
+    -- Lag Ghost: luôn start thread (thread tự check GhostShow mỗi frame)
+    StartGhostThread(FL_CancelToken)
     FL_Thread = true
 end
 
 local function StopFakeLag()
     Config.FakeLag.Enabled = false
     FL_QueueActive = false
-    -- [FIX-4]: Đặt token.dead = true → TẤT CẢ threads liên quan break ngay
-    --          (Worker, BurstCycle, Jitter đều check token mỗi Heartbeat)
+    -- Đặt token.dead = true → TẤT CẢ threads liên quan break ngay
+    -- (Worker, BurstCycle, Jitter, Ghost đều check token mỗi Heartbeat)
     if FL_CancelToken then
         FL_CancelToken.dead = true
         FL_CancelToken = nil
     end
-    -- FL_Thread sẽ được reset sau khi worker thread thoát;
-    -- set về nil ở đây để StartFakeLag() có thể gọi lại
+    -- Hủy ghost model ngay lập tức
+    DestroyGhost()
+    -- Set về nil để StartFakeLag() có thể gọi lại
     FL_Thread = nil
-    FL_JitterThread = nil  -- thread sẽ tự nil sau khi thoát loop
+    FL_JitterThread = nil
+    FL_GhostThread  = nil
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -1933,7 +2256,7 @@ T_FakeLag:CreateSection("🫨 Position Jitter (Server-side Stutter)")
 T_FakeLag:CreateToggle({ Name="Position Jitter — Nhân vật giật phía server", CurrentValue=Config.FakeLag.PosJitter, Flag="FL_PJ",
     Callback=function(v)
         Config.FakeLag.PosJitter = v
-        if v and Config.FakeLag.Enabled then StartJitter() end
+        if v and Config.FakeLag.Enabled and FL_CancelToken then StartJitter(FL_CancelToken) end
     end })
 T_FakeLag:CreateSlider({ Name="Jitter Amount (0=tắt, 1=luôn freeze)", Range={0.01,0.95}, Increment=0.01,
     CurrentValue=Config.FakeLag.JitterAmt, Flag="FL_JA",
@@ -1942,25 +2265,96 @@ T_FakeLag:CreateParagraph({ Title="ℹ️ Jitter hoạt động thế nào?",
     Content="Ngẫu nhiên freeze vị trí HumanoidRootPart.\n"
          .. "Server thấy nhân vật bạn đứng yên rồi teleport → khó nhắm rất.\n"
          .. "Client-side bạn không bị ảnh hưởng gì." })
+T_FakeLag:CreateSection("👻 Ghost Lag (Lag Chams / Ảo Ảnh)")
+-- [PART-2] Ghost Lag UI — bóng ma hiện vị trí server đang nhận diện bạn
+T_FakeLag:CreateToggle({ Name="Ghost Lag — Hiện bóng ma vị trí lag", CurrentValue=Config.FakeLag.GhostShow, Flag="FL_Ghost",
+    Callback=function(v)
+        Config.FakeLag.GhostShow = v
+        -- Nếu tắt: destroy ghost ngay lập tức (memory cleanup)
+        if not v then DestroyGhost() end
+    end })
+T_FakeLag:CreateColorPicker({ Name="Màu Ghost (Color3)", Color=Config.FakeLag.GhostColor, Flag="FL_GhostCol",
+    Callback=function(v)
+        Config.FakeLag.GhostColor = v
+        -- Update live nếu ghost đang tồn tại
+        if FL_GhostModel then
+            for _, p in ipairs(FL_GhostModel:GetChildren()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    p.Color = v
+                end
+            end
+        end
+    end })
+T_FakeLag:CreateSlider({ Name="Ghost Transparency (0=đặc, 1=ẩn)", Range={0.1,0.95}, Increment=0.05,
+    CurrentValue=Config.FakeLag.GhostTrans, Flag="FL_GhostTr",
+    Callback=function(v)
+        Config.FakeLag.GhostTrans = v
+        -- Update live
+        if FL_GhostModel then
+            for _, p in ipairs(FL_GhostModel:GetChildren()) do
+                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                    p.Transparency = v
+                end
+            end
+        end
+    end })
+T_FakeLag:CreateDropdown({ Name="Ghost Material", Options={"ForceField","Neon","SmoothPlastic"},
+    CurrentOption={"ForceField"}, Flag="FL_GhostMat",
+    Callback=function(o)
+        -- Áp material mới lên ghost đang tồn tại ngay lập tức
+        local matMap = { ForceField=Enum.Material.ForceField, Neon=Enum.Material.Neon, SmoothPlastic=Enum.Material.SmoothPlastic }
+        local mat = matMap[o[1]] or Enum.Material.ForceField
+        if FL_GhostModel then
+            for _, p in ipairs(FL_GhostModel:GetChildren()) do
+                if p:IsA("BasePart") then p.Material = mat end
+            end
+        end
+    end })
+T_FakeLag:CreateButton({ Name="🔄 Rebuild Ghost ngay",
+    Callback=function()
+        -- Force rebuild ghost model (dùng khi character đổi skin/outfit)
+        DestroyGhost()
+        local char = LP.Character
+        if char and Config.FakeLag.GhostShow then
+            local g = CreateGhost(char)
+            Rayfield:Notify({ Title="👻 Ghost", Content=g and "Rebuild thành công!" or "Thất bại (chưa spawn?)", Duration=3, Image=4483362458 })
+        else
+            Rayfield:Notify({ Title="👻 Ghost", Content="Bật Ghost Show trước!", Duration=3, Image=4483362458 })
+        end
+    end })
+T_FakeLag:CreateParagraph({ Title="ℹ️ Ghost Lag hoạt động thế nào?",
+    Content="Tạo bản sao bán trong suốt của nhân vật, đứng ở vị trí lag (PingMs giây trước).\n"
+         .. "→ Bạn thấy được chính xác server đang nhìn thấy bạn ở đâu.\n"
+         .. "Chỉ client thấy ghost, server không nhận — không vi phạm thêm." })
 
 T_FakeLag:CreateSection("⚡ Control")
 T_FakeLag:CreateButton({ Name="⚡ Flush Queue (Gửi hết packets đọng)",
     Callback=function()
-        local count = #FL_PacketQueue
-        for _, pkt in ipairs(FL_PacketQueue) do pcall(pkt.fn) end
-        FL_PacketQueue = {}
+        -- [FIX] FL_PacketQueue là Queue struct {data,head,tail}, không phải array thường
+        local q = FL_PacketQueue
+        local count = 0
         FL_QueueActive = false
+        for i = q.head, q.tail do
+            local pkt = q.data[i]
+            if pkt then pcall(pkt.fn); count = count + 1 end
+        end
+        Q_Reset(q)
         Rayfield:Notify({ Title="⚡ Flushed", Content=count.." packets đã được gửi.", Duration=3, Image=4483362458 })
     end })
 T_FakeLag:CreateButton({ Name="📊 Xem trạng thái Queue",
     Callback=function()
+        -- [FIX] Đếm đúng từ Queue struct
+        local q = FL_PacketQueue
+        local qCount = 0
+        for i = q.head, q.tail do if q.data[i] then qCount = qCount + 1 end end
         Rayfield:Notify({
             Title   = "🌀 FakeLag Status",
-            Content = format("Queue: %d packets\nSimPing: %dms ±%dms\nBurst: %s | Jitter: %s",
-                #FL_PacketQueue,
+            Content = format("Queue: %d packets\nSimPing: %dms ±%dms\nBurst: %s | Jitter: %s\nGhost: %s",
+                qCount,
                 Config.FakeLag.PingMs, Config.FakeLag.PingJitter,
                 Config.FakeLag.BurstMode and "ON" or "OFF",
-                Config.FakeLag.PosJitter and "ON" or "OFF"),
+                Config.FakeLag.PosJitter and "ON" or "OFF",
+                Config.FakeLag.GhostShow and "ON" or "OFF"),
             Duration = 5, Image = 4483362458
         })
     end })
