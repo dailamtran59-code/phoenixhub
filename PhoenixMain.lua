@@ -469,6 +469,18 @@ end
 -- [FIX-1]: InvokeServer KHÔNG BAO GIỜ bị queue — gọi thẳng OldNC ngay lập tức.
 --          Chỉ FireServer mới được đẩy vào FL_PacketQueue.
 --          Lý do: delay InvokeServer + return nil phá vỡ mọi LocalScript yield/wait.
+
+local FireServerRaw
+local UnreliableFireServerRaw
+pcall(function()
+    local re = Instance.new("RemoteEvent")
+    FireServerRaw = re.FireServer
+    re:Destroy()
+    local ure = Instance.new("UnreliableRemoteEvent")
+    UnreliableFireServerRaw = ure.FireServer
+    ure:Destroy()
+end)
+
 if hasHook and hasCheck then
     local OldNC
     OldNC = hookmetamethod(game, "__namecall", function(self, ...)
@@ -536,8 +548,15 @@ if hasHook and hasCheck then
             and method == "FireServer" then          -- ← chỉ FireServer
             local _self = self
             local _args = {...}
+            local _class = _self.ClassName
             local queued = FL_QueuePacket(function()
-                OldNC(_self, unpack(_args))
+                if _class == "UnreliableRemoteEvent" and UnreliableFireServerRaw then
+                    pcall(UnreliableFireServerRaw, _self, unpack(_args))
+                elseif _class == "RemoteEvent" and FireServerRaw then
+                    pcall(FireServerRaw, _self, unpack(_args))
+                else
+                    pcall(function() _self:FireServer(unpack(_args)) end)
+                end
             end)
             if queued then return nil end            -- FireServer đã queue
         end
@@ -1450,7 +1469,8 @@ local function StartPacketWorker(token)
                     if token.dead then break end
                     local pkt = q.data[i]
                     if pkt then
-                        if now >= pkt.fireAt then
+                        -- [BURST FIX] Nếu BurstMode BẬT, xả toàn bộ hàng đợi ngay khi Hold kết thúc!
+                        if Config.FakeLag.BurstMode or now >= pkt.fireAt then
                             -- Gói đến hạn → fire ngay
                             pcall(pkt.fn)
                             q.data[i] = nil  -- xóa slot đã gửi
@@ -1502,63 +1522,74 @@ local function StartBurstCycle(token)
     end)
 end
 
--- ── Position Jitter Thread ─────────────────────────────────
--- [BUG-3 FIX]:
---   • Lưu oldVel = hrp.AssemblyLinearVelocity TRƯỚC khi cộng noise.
---   • Noise chỉ trên trục X và Z (Y = 0) → KHÔNG ảnh hưởng trọng lực.
---   • Reset về oldVel (không phải Vector3.zero) → giữ nguyên gravity
---     và vận tốc di chuyển gốc, nhân vật vẫn nhảy và rơi bình thường.
+-- ── [10] POSITION JITTER THREAD (CFrame Network Desync) ───────
+-- [REAL FAKELAG FIX]: Adding velocity noise does NOT make you lag to others.
+-- We must use a RenderStepped/Heartbeat CFrame Swap:
+-- 1. Heartbeat (before network rep): Override hrp.CFrame to the Lagged CFrame.
+-- 2. RenderStepped (before camera/physics): Restore the Real CFrame so the client is 100% smooth.
 local function StartJitter(token)
     if FL_JitterThread then return end
     FL_JitterThread = tspawn(function()
-        local jitterOn = false
-        local savedVel = nil  -- lưu vận tốc gốc trước khi cộng noise
-        while not token.dead and Config.FakeLag.PosJitter do
+        local rsConn, hbConn
+        local realCF, realVel
+        local lagCF, lagVel
+        local lastLagUpdate = 0
+        
+        rsConn = RunService.RenderStepped:Connect(function()
+            if token.dead or not Config.FakeLag.PosJitter then return end
+            local lpChar = LP.Character
+            local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+            if hrp and realCF then
+                -- Restore real position for local camera and physics simulation
+                hrp.CFrame = realCF
+                if realVel then hrp.AssemblyLinearVelocity = realVel end
+            end
+        end)
+        
+        hbConn = RunService.Heartbeat:Connect(function()
+            if token.dead or not Config.FakeLag.PosJitter then return end
             local lpChar = LP.Character
             local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
             if hrp then
-                if rand() < Config.FakeLag.JitterAmt then
-                    if not jitterOn then
-                        -- [BUG-3 FIX] Lưu vận tốc gốc (bao gồm gravity Y)
-                        pcall(function()
-                            savedVel = hrp.AssemblyLinearVelocity
-                        end)
-                        -- Áp dụng xung lực ngẫu nhiên NHỎ trên X/Z
-                        -- Y = 0 tuyệt đối → KHÔNG bay lên trời
-                        local mag = 12 + rand() * 8  -- 12-20 studs/s
-                        local noise = Vector3.new(
-                            (rand() * 2 - 1) * mag,
-                            0,                        -- ← Y luôn = 0
-                            (rand() * 2 - 1) * mag
-                        )
-                        pcall(function()
-                            hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity + noise
-                        end)
-                        jitterOn = true
-                    end
+                -- Heartbeat fires AFTER physics simulation. Save newly simulated real position.
+                realCF = hrp.CFrame
+                realVel = hrp.AssemblyLinearVelocity
+                
+                local now = tick()
+                local updateInterval = max(0.05, Config.FakeLag.JitterAmt)
+                
+                -- If Burst Hold is active, freeze the lagCF entirely!
+                if Config.FakeLag.BurstMode and FL_QueueActive then
+                    -- hold lagCF
                 else
-                    if jitterOn then
-                        -- [BUG-3 FIX] Khôi phục vận tốc gốc (KHÔNG reset zero)
-                        -- → Giữ nguyên trọng lực (Y) và momentum di chuyển
-                        pcall(function()
-                            if savedVel then
-                                hrp.AssemblyLinearVelocity = savedVel
-                            end
-                        end)
-                        savedVel = nil
-                        jitterOn = false
+                    if not lagCF or (now - lastLagUpdate) >= updateInterval then
+                        lagCF = realCF
+                        lagVel = realVel
+                        lastLagUpdate = now
                     end
                 end
+                
+                -- Override CFrame to the Lagged CFrame for network replication!
+                if lagCF then
+                    hrp.CFrame = lagCF
+                    local currentVel = hrp.AssemblyLinearVelocity
+                    hrp.AssemblyLinearVelocity = Vector3.new(0, currentVel.Y, 0) -- stop server extrapolation but keep gravity
+                end
             end
-            RunService.Heartbeat:Wait()
+        end)
+        
+        while not token.dead and Config.FakeLag.PosJitter do
+            tw(0.1)
         end
-        -- Cleanup khi thoát: khôi phục velocity gốc nếu đang jitter
-        if jitterOn and savedVel then
-            local lpChar = LP.Character
-            local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function() hrp.AssemblyLinearVelocity = savedVel end)
-            end
+        
+        -- Cleanup
+        rsConn:Disconnect()
+        hbConn:Disconnect()
+        local lpChar = LP.Character
+        local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+        if hrp and realCF then
+            hrp.CFrame = realCF
+            if realVel then hrp.AssemblyLinearVelocity = realVel end
         end
         FL_JitterThread = nil
     end)
