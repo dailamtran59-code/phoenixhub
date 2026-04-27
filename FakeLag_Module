@@ -109,6 +109,17 @@ local function FL_QueuePacket(fn)
     return true
 end
 
+local FireServerRaw
+local UnreliableFireServerRaw
+pcall(function()
+    local re = Instance.new("RemoteEvent")
+    FireServerRaw = re.FireServer
+    re:Destroy()
+    local ure = Instance.new("UnreliableRemoteEvent")
+    UnreliableFireServerRaw = ure.FireServer
+    ure:Destroy()
+end)
+
 -- ── [7] HOOK __namecall ────────────────────────────────────
 -- Only install if executor supports hookmetamethod + checkcaller.
 local OldNC
@@ -120,11 +131,19 @@ if hasHook and hasCheck then
         if not checkcaller()
             and Config.FakeLag.Enabled
             and Config.FakeLag.SimPing
-            and method == "FireServer" then
+            and method == "FireServer"
+            and (self:IsA("RemoteEvent") or self:IsA("UnreliableRemoteEvent")) then
             local _self = self
             local _args = {...}
+            local _class = _self.ClassName
             local queued = FL_QueuePacket(function()
-                OldNC(_self, unpack(_args))
+                if _class == "UnreliableRemoteEvent" and UnreliableFireServerRaw then
+                    pcall(UnreliableFireServerRaw, _self, unpack(_args))
+                elseif _class == "RemoteEvent" and FireServerRaw then
+                    pcall(FireServerRaw, _self, unpack(_args))
+                else
+                    pcall(function() _self:FireServer(unpack(_args)) end)
+                end
             end)
             if queued then return nil end
         end
@@ -145,7 +164,7 @@ local function StartPacketWorker(token)
             local q   = PacketQueue
 
             -- Amortized compact
-            if q.head > 64 then Q_Compact(q) end
+            if q.head > 256 then Q_Compact(q) end
             if Q_IsEmpty(q) then Q_Reset(q) end
 
             -- [BUG-1 FIX] Only fire when NOT in Burst Hold
@@ -155,7 +174,8 @@ local function StartPacketWorker(token)
                     if token.dead then break end
                     local pkt = q.data[i]
                     if pkt then
-                        if now >= pkt.fireAt then
+                        -- [BURST FIX]: If BurstMode is ON, flush everything instantly when Hold is released!
+                        if Config.FakeLag.BurstMode or now >= pkt.fireAt then
                             pcall(pkt.fn)
                             q.data[i] = nil
                         else
@@ -187,73 +207,90 @@ local function StartBurstCycle(token)
     tspawn(function()
         while not token.dead and Config.FakeLag.BurstMode do
             FL_QueueActive = true           -- Accumulate
-            tw(Config.FakeLag.BurstHold)
+            local elapsedHold = 0
+            while elapsedHold < Config.FakeLag.BurstHold and not token.dead do
+                elapsedHold = elapsedHold + RunService.Heartbeat:Wait()
+            end
             if token.dead then break end
             FL_QueueActive = false          -- Release burst
-            tw(Config.FakeLag.BurstFire)
+            local elapsedFire = 0
+            while elapsedFire < Config.FakeLag.BurstFire and not token.dead do
+                elapsedFire = elapsedFire + RunService.Heartbeat:Wait()
+            end
         end
         FL_QueueActive = false
     end)
 end
 
--- ── [10] POSITION JITTER THREAD ────────────────────────────
--- [BUG-3 FIX]:
---   • Saves original AssemblyLinearVelocity before adding noise.
---   • Noise only on X/Z (Y = 0) — preserves gravity component.
---   • Restores savedVel (not Vector3.zero) when jitter ends.
+-- ── [10] POSITION JITTER THREAD (CFrame Network Desync) ───────
+-- [REAL FAKELAG FIX]: Adding velocity noise does NOT make you lag to others.
+-- We must use a RenderStepped/Heartbeat CFrame Swap:
+-- 1. Heartbeat (before network rep): Override hrp.CFrame to the Lagged CFrame.
+-- 2. RenderStepped (before camera/physics): Restore the Real CFrame so the client is 100% smooth.
 local function StartJitter(token)
     if FL_JitterThread then return end
     FL_JitterThread = tspawn(function()
-        local jitterOn = false
-        local savedVel = nil
-
-        while not token.dead and Config.FakeLag.PosJitter do
+        local rsConn, hbConn
+        local realCF, realVel
+        local lagCF, lagVel
+        local lastLagUpdate = 0
+        
+        rsConn = RunService.RenderStepped:Connect(function()
+            if token.dead or not Config.FakeLag.PosJitter then return end
             local lpChar = LP.Character
-            local hrp    = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
-
+            local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+            if hrp and realCF then
+                -- Restore real position for local camera and physics simulation
+                hrp.CFrame = realCF
+                if realVel then hrp.AssemblyLinearVelocity = realVel end
+            end
+        end)
+        
+        hbConn = RunService.Heartbeat:Connect(function()
+            if token.dead or not Config.FakeLag.PosJitter then return end
+            local lpChar = LP.Character
+            local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
             if hrp then
-                if rand() < Config.FakeLag.JitterAmt then
-                    if not jitterOn then
-                        -- Save original velocity (includes gravity Y)
-                        pcall(function() savedVel = hrp.AssemblyLinearVelocity end)
-                        -- Apply horizontal-only noise (Y = 0 always)
-                        local mag = 12 + rand() * 8  -- 12-20 studs/s
-                        local noise = Vector3.new(
-                            (rand() * 2 - 1) * mag,
-                            0,
-                            (rand() * 2 - 1) * mag
-                        )
-                        pcall(function()
-                            hrp.AssemblyLinearVelocity = hrp.AssemblyLinearVelocity + noise
-                        end)
-                        jitterOn = true
-                    end
+                -- Heartbeat fires AFTER physics simulation. Save newly simulated real position.
+                realCF = hrp.CFrame
+                realVel = hrp.AssemblyLinearVelocity
+                
+                local now = tick()
+                local updateInterval = max(0.05, Config.FakeLag.JitterAmt)
+                
+                -- If Burst Hold is active, freeze the lagCF entirely!
+                if Config.FakeLag.BurstMode and FL_QueueActive then
+                    -- hold lagCF
                 else
-                    if jitterOn then
-                        -- Restore original velocity — NOT Vector3.zero
-                        pcall(function()
-                            if savedVel then
-                                hrp.AssemblyLinearVelocity = savedVel
-                            end
-                        end)
-                        savedVel = nil
-                        jitterOn = false
+                    if not lagCF or (now - lastLagUpdate) >= updateInterval then
+                        lagCF = realCF
+                        lagVel = realVel
+                        lastLagUpdate = now
                     end
                 end
+                
+                -- Override CFrame to the Lagged CFrame for network replication!
+                if lagCF then
+                    hrp.CFrame = lagCF
+                    local currentVel = hrp.AssemblyLinearVelocity
+                    hrp.AssemblyLinearVelocity = Vector3.new(0, currentVel.Y, 0)
+                end
             end
-
-            RunService.Heartbeat:Wait()
+        end)
+        
+        while not token.dead and Config.FakeLag.PosJitter do
+            tw(0.1)
         end
-
-        -- Cleanup: restore if still jittering when thread exits
-        if jitterOn and savedVel then
-            local lpChar = LP.Character
-            local hrp    = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                pcall(function() hrp.AssemblyLinearVelocity = savedVel end)
-            end
+        
+        -- Cleanup
+        rsConn:Disconnect()
+        hbConn:Disconnect()
+        local lpChar = LP.Character
+        local hrp = lpChar and lpChar:FindFirstChild("HumanoidRootPart")
+        if hrp and realCF then
+            hrp.CFrame = realCF
+            if realVel then hrp.AssemblyLinearVelocity = realVel end
         end
-
         FL_JitterThread = nil
     end)
 end
@@ -357,6 +394,11 @@ local function StartGhostThread(token)
         local MAX_HIST  = 3.0      -- seconds of history to keep
         local ghost     = nil
         local rebuildCD = 0
+        local charAddedConn = LP.CharacterAdded:Connect(function()
+            DestroyGhost()
+            ghost = nil
+            rebuildCD = 0
+        end)
 
         while not token.dead and Config.FakeLag.Enabled do
             local now    = tick()
@@ -431,6 +473,7 @@ local function StartGhostThread(token)
         end
 
         -- Cleanup on thread exit
+        charAddedConn:Disconnect()
         DestroyGhost()
         ghost   = nil
         history = nil
