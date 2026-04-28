@@ -1,0 +1,297 @@
+-- ============================================================
+-- SilentAim Module v5.0 — Optimized & Independent
+-- ============================================================
+-- Features: 
+-- 1. O(1) Pre-computed HitRemote identification (XOR Obfuscation)
+-- 2. Target Finder built-in (FOV, Wallbang, TeamCheck)
+-- 3. Robust FireServer & Raycast Redirection
+-- 4. Simple but effective Prediction
+-- ============================================================
+
+local SilentAimModule = (function()
+
+-- ── [1] SERVICES & ALIASES ─────────────────────────────────
+local Players       = game:GetService("Players")
+local Workspace     = game:GetService("Workspace")
+local RunService    = game:GetService("RunService")
+local LP            = Players.LocalPlayer
+local Camera        = Workspace.CurrentCamera
+
+local hasHook   = type(hookmetamethod) == "function"
+local hasCheck  = type(checkcaller)    == "function"
+
+local lower  = string.lower
+local find   = string.find
+local insert = table.insert
+local byte   = string.byte
+local char   = string.char
+local concat = table.concat
+
+-- ── [2] CONFIGURATION ──────────────────────────────────────
+local Config = {
+    Enabled         = false,
+    AimPart         = "Head",
+    FOV             = 150,
+    Wallbang        = false,
+    TeamCheck       = true,
+    Prediction      = 0.12,
+    SilentStrength  = 1.0,
+    
+    -- Tùy chọn (Advanced)
+    HookInvoke      = false, -- Có redirect InvokeServer không (mặc định tắt)
+    UseMouseHook    = false, -- Hook Mouse.Hit (thường không cần thiết, mặc định tắt)
+}
+
+-- ── [3] XOR DECODING & PRE-COMPUTE ─────────────────────────
+local OBF_KEY = 0x3F
+local _bxor = bit32 and bit32.bxor or function(a, b)
+    local result, bit = 0, 1
+    while a > 0 or b > 0 do
+        local ra, rb = a % 2, b % 2
+        if ra ~= rb then result = result + bit end
+        a, b, bit = (a - ra) / 2, (b - rb) / 2, bit * 2
+    end
+    return result
+end
+
+local function xorStr(s, k)
+    local t = {}
+    for i = 1, #s do t[i] = char(_bxor(byte(s, i), k)) end
+    return concat(t)
+end
+
+local RIVALS_HIT_OBF = {
+    xorStr("hit",OBF_KEY), xorStr("Hit",OBF_KEY),
+    xorStr("damage",OBF_KEY), xorStr("Damage",OBF_KEY),
+    xorStr("shoot",OBF_KEY), xorStr("Shoot",OBF_KEY),
+    xorStr("fire",OBF_KEY), xorStr("Fire",OBF_KEY),
+    xorStr("bullet",OBF_KEY), xorStr("Bullet",OBF_KEY),
+    xorStr("attack",OBF_KEY), xorStr("Attack",OBF_KEY),
+    xorStr("gun",OBF_KEY), xorStr("shot",OBF_KEY),
+    xorStr("ray",OBF_KEY), xorStr("projectile",OBF_KEY),
+    xorStr("deal",OBF_KEY), xorStr("inflict",OBF_KEY),
+}
+
+local HitRemotesSet  = {}   -- O(1) exact match
+local HitRemotesList = {}   -- Substring fallback
+for _, ob in ipairs(RIVALS_HIT_OBF) do
+    local decoded = lower(xorStr(ob, OBF_KEY))
+    HitRemotesSet[decoded] = true
+    insert(HitRemotesList, decoded)
+end
+
+local function isHitRemote(name)
+    if not name or name == "" then return false end
+    local lo = lower(name)
+    if HitRemotesSet[lo] then return true end
+    for _, kw in ipairs(HitRemotesList) do
+        if find(lo, kw, 1, true) then return true end
+    end
+    return false
+end
+
+-- ── [4] INTERNAL UTILITIES ─────────────────────────────────
+
+local RayParams = RaycastParams.new()
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function UpdateRayParams()
+    RayParams.FilterDescendantsInstances = { LP.Character or Instance.new("Folder"), Camera }
+end
+
+local function IsSameTeam(targetPlayer, localPlayer)
+    if not targetPlayer or not localPlayer then return false end
+    -- Default Roblox Team
+    local ok1, lpTeam  = pcall(function() return localPlayer.Team  end)
+    local ok2, tgtTeam = pcall(function() return targetPlayer.Team end)
+    if ok1 and ok2 and lpTeam ~= nil and tgtTeam ~= nil then
+        return lpTeam == tgtTeam
+    end
+    -- TeamColor
+    local ok3, lpColor  = pcall(function() return localPlayer.TeamColor  end)
+    local ok4, tgtColor = pcall(function() return targetPlayer.TeamColor end)
+    if ok3 and ok4 and lpColor ~= nil and tgtColor ~= nil then
+        if lpColor ~= BrickColor.new("White") or tgtColor ~= BrickColor.new("White") then
+            return lpColor == tgtColor
+        end
+    end
+    return false
+end
+
+local function GetTarget()
+    local lpChar = LP.Character
+    if not lpChar then return nil, nil end
+    UpdateRayParams()
+    
+    local bestDist = Config.FOV
+    local bestPart = nil
+    local targetPlr = nil
+    local sc = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local camPos = Camera.CFrame.Position
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LP then continue end
+        if Config.TeamCheck and IsSameTeam(p, LP) then continue end
+        
+        local char = p.Character
+        local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        local part = char and char:FindFirstChild(Config.AimPart)
+        
+        if hum and hum.Health > 0 and part then
+            local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
+            if onScreen then
+                local dist2D = (Vector2.new(sp.X, sp.Y) - sc).Magnitude
+                if dist2D < bestDist then
+                    -- Wallbang check
+                    if not Config.Wallbang then
+                        local dir = part.Position - camPos
+                        if dir.Magnitude > 0.1 then
+                            local ray = Workspace:Raycast(camPos, dir, RayParams)
+                            if ray and not ray.Instance:IsDescendantOf(char) then continue end
+                        end
+                    end
+                    bestDist = dist2D
+                    bestPart = part
+                    targetPlr = p
+                end
+            end
+        end
+    end
+    return bestPart, targetPlr
+end
+
+-- Lấy vị trí dự đoán đơn giản
+local function GetPredictedPosition(targetPart, targetPlayer)
+    if not targetPart then return nil end
+    local aimPos = targetPart.Position
+    local ok, predPos = pcall(function()
+        -- Ưu tiên HRP AssemblyLinearVelocity vì nó ổn định hơn
+        local vel = targetPart.Velocity or Vector3.zero
+        if targetPlayer and targetPlayer.Character then
+            local hrp = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then vel = hrp.AssemblyLinearVelocity end
+        end
+        return targetPart.Position + (vel * Config.Prediction)
+    end)
+    if ok and predPos then return predPos end
+    return aimPos
+end
+
+-- ── [5] METAMETHOD HOOKS ───────────────────────────────────
+
+local OldNC, OldIndex
+local TargetRef = nil
+local TargetPlayer = nil
+
+local function SetupHooks()
+    if not hasHook or not hasCheck then return end
+    if OldNC or OldIndex then return end
+
+    -- Vòng lặp cập nhật Target liên tục
+    task.spawn(function()
+        while task.wait() do
+            if Config.Enabled then
+                TargetRef, TargetPlayer = GetTarget()
+            else
+                TargetRef, TargetPlayer = nil, nil
+            end
+        end
+    end)
+
+    -- Hook __namecall (FireServer, InvokeServer, Raycast)
+    OldNC = hookmetamethod(game, "__namecall", function(self, ...)
+        if checkcaller() or not Config.Enabled or not TargetRef then
+            return OldNC(self, ...)
+        end
+
+        local method = getnamecallmethod()
+
+        -- 1. REMOTE EVENT / FUNCTION HOOK
+        if (method == "FireServer" and self:IsA("RemoteEvent")) or 
+           (Config.HookInvoke and method == "InvokeServer" and self:IsA("RemoteFunction")) then
+            local nm = rawget(self, "Name") or ""
+            if isHitRemote(nm) then
+                local args = {...}
+                local aimPos = GetPredictedPosition(TargetRef, TargetPlayer)
+                local camPos = Camera.CFrame.Position
+                local modified = false
+
+                for i, arg in ipairs(args) do
+                    local t = typeof(arg)
+                    if t == "CFrame" then
+                        args[i] = arg:Lerp(CFrame.lookAt(arg.Position, aimPos), Config.SilentStrength)
+                        modified = true
+                    elseif t == "Vector3" and arg.Magnitude > 0.5 then
+                        -- Directional Vector3 Redirection (giữ nguyên độ dài, chuyển hướng)
+                        local dir = aimPos - camPos
+                        if dir.Magnitude > 0.1 then
+                            local newDir = dir.Unit * arg.Magnitude
+                            -- Nội suy SilentStrength cho Vector3
+                            args[i] = arg:Lerp(newDir, Config.SilentStrength)
+                            modified = true
+                        end
+                    elseif t == "Instance" and pcall(function() return arg:IsA("BasePart") end) then
+                        args[i] = TargetRef
+                        modified = true
+                    end
+                end
+
+                if modified then return OldNC(self, unpack(args)) end
+            end
+        end
+
+        -- 2. RAYCAST HOOK
+        if method == "Raycast" and self == Workspace then
+            local args = {...}
+            if typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
+                local aimPos = GetPredictedPosition(TargetRef, TargetPlayer)
+                local origin = args[1]
+                local oldDir = args[2]
+                
+                local dir = aimPos - origin
+                if dir.Magnitude > 0.1 then
+                    -- Preserve length of raycast, apply SilentStrength
+                    local newDir = dir.Unit * oldDir.Magnitude
+                    args[2] = oldDir:Lerp(newDir, Config.SilentStrength)
+                    return OldNC(self, unpack(args))
+                end
+            end
+        end
+
+        return OldNC(self, ...)
+    end)
+
+    -- Hook __index (Mouse.Hit / Mouse.Target) - Mặc định tắt, dùng nếu game cần
+    OldIndex = hookmetamethod(game, "__index", function(self, key)
+        if checkcaller() or not Config.Enabled or not Config.UseMouseHook or not TargetRef then
+            return OldIndex(self, key)
+        end
+
+        if self:IsA("Mouse") then
+            local hk = tostring(key):lower()
+            if hk == "hit" then
+                local aimPos = GetPredictedPosition(TargetRef, TargetPlayer)
+                return CFrame.new(aimPos)
+            elseif hk == "target" then
+                return TargetRef
+            end
+        end
+
+        return OldIndex(self, key)
+    end)
+end
+
+-- ── [6] PUBLIC API ─────────────────────────────────────────
+return {
+    Config       = Config,
+    Start        = function() SetupHooks() end,
+    GetTarget    = function() return TargetRef, TargetPlayer end,
+    Caps = {
+        hookmetamethod = hasHook,
+        checkcaller    = hasCheck,
+    }
+}
+
+end)()
+
+return SilentAimModule
